@@ -7,8 +7,6 @@ from transformers.models.clip.modeling_clip import (
 from transformers.modeling_attn_mask_utils import _create_4d_causal_attention_mask
 
 from modules.processing import StableDiffusionProcessing
-from modules.shared import opts as shared_opts
-from modules.sd_emphasis import get_current_option
 
 
 class IllustriousPadEnhancerHook:
@@ -17,10 +15,34 @@ class IllustriousPadEnhancerHook:
         self.original_encoder_forward_g: Optional[object] = None
         self.original_embeddings_forward_l: Optional[object] = None
         self.original_embeddings_forward_g: Optional[object] = None
-        self.original_after_transformers: Optional[object] = None
+        self.original_encode_with_transformers_l: Optional[object] = None
+        self.original_encode_with_transformers_g: Optional[object] = None
         self.eos_position: Optional[int] = None
         self.previous_options: Optional[dict] = None
         self.conds: List[dict] = []
+
+    def _get_patched_clip_encode_with_transformers(
+        self,
+        original_encode_with_transformers: Callable,
+    ):
+        def encode_with_transformers(
+            tokens,
+        ):
+            output = original_encode_with_transformers(tokens)
+            truncated_output = output[:, :77, :]
+            extra_output = output[:, 77:, :]
+            self.conds.append(
+                {
+                    "extra_output": extra_output,
+                    "eos_position": self.eos_position,
+                }
+            )
+            if hasattr(output, "pooled"):
+                truncated_output.pooled = output.pooled
+
+            return truncated_output
+
+        return encode_with_transformers
 
     def _get_patched_clip_encoder_forward(
         self,
@@ -57,7 +79,6 @@ class IllustriousPadEnhancerHook:
                 output_hidden_states,
                 return_dict,
             )
-            print(encoder_outputs.hidden_states)
             return encoder_outputs
 
         return forward
@@ -106,21 +127,6 @@ class IllustriousPadEnhancerHook:
 
         return forward
 
-    def _get_patched_emphasis_after_transformers(
-        self,
-        original_after_transformers: Callable,
-    ):
-        def after_transformers(self):
-            if self.z.shape[1] > 77:
-                z_temp = self.z[:, 77:, :]
-                self.z = self.z[:, :77, :]
-                original_after_transformers(self)
-                self.z = torch.cat([self.z, z_temp], dim=1)
-            else:
-                original_after_transformers(self)
-
-        return after_transformers
-
     def process(
         self,
         p: StableDiffusionProcessing,
@@ -129,6 +135,8 @@ class IllustriousPadEnhancerHook:
         pad_length: int,
         pad_enable_normalization: bool,
     ) -> None:
+        # clear conds
+        self.conds = []
         # clear prompt cache
         current_options = {
             "pad_enable": pad_enable,
@@ -157,13 +165,8 @@ class IllustriousPadEnhancerHook:
             return
 
         # patch CLIP text encoders
-        text_model_l = (
-            p.sd_model.forge_objects.clip.cond_stage_model.clip_l.transformer.text_model
-        )
-        text_model_g = (
-            p.sd_model.forge_objects.clip.cond_stage_model.clip_g.transformer.text_model
-        )
-        emphasis = get_current_option(shared_opts.emphasis)
+        text_model_l = p.sd_model.clip.embedders[0].wrapped.transformer.text_model
+        text_model_g = p.sd_model.clip.embedders[1].wrapped.transformer.text_model
 
         if not pad_enable:
             if self.original_encoder_forward_l is not None:
@@ -178,9 +181,16 @@ class IllustriousPadEnhancerHook:
             if self.original_embeddings_forward_g is not None:
                 text_model_g.embeddings.forward = self.original_embeddings_forward_g
                 self.original_embeddings_forward_g = None
-            if self.original_after_transformers is not None:
-                emphasis.after_transformers = self.original_after_transformers
-                self.original_after_transformers = None
+            if self.original_encode_with_transformers_l is not None:
+                p.sd_model.clip.embedders[
+                    0
+                ].encode_with_transformers = self.original_encode_with_transformers_l
+                self.original_encode_with_transformers_l = None
+            if self.original_encode_with_transformers_g is not None:
+                p.sd_model.clip.embedders[
+                    1
+                ].encode_with_transformers = self.original_encode_with_transformers_g
+                self.original_encode_with_transformers_g = None
             return
 
         if self.original_encoder_forward_l is None:
@@ -191,8 +201,14 @@ class IllustriousPadEnhancerHook:
             self.original_embeddings_forward_l = text_model_l.embeddings.forward
         if self.original_embeddings_forward_g is None:
             self.original_embeddings_forward_g = text_model_g.embeddings.forward
-        if self.original_after_transformers is None:
-            self.original_after_transformers = emphasis.after_transformers
+        if self.original_encode_with_transformers_l is None:
+            self.original_encode_with_transformers_l = p.sd_model.clip.embedders[
+                0
+            ].encode_with_transformers
+        if self.original_encode_with_transformers_g is None:
+            self.original_encode_with_transformers_g = p.sd_model.clip.embedders[
+                1
+            ].encode_with_transformers
 
         text_model_l.encoder.forward = self._get_patched_clip_encoder_forward(
             self.original_encoder_forward_l,
@@ -226,8 +242,15 @@ class IllustriousPadEnhancerHook:
                 pad_length,
             )
         )
-        emphasis.after_transformers = self._get_patched_emphasis_after_transformers(
-            self.original_after_transformers
+        p.sd_model.clip.embedders[
+            0
+        ].encode_with_transformers = self._get_patched_clip_encode_with_transformers(
+            self.original_encode_with_transformers_l,
+        )
+        p.sd_model.clip.embedders[
+            1
+        ].encode_with_transformers = self._get_patched_clip_encode_with_transformers(
+            self.original_encode_with_transformers_g,
         )
 
     def process_before_every_sampling(
@@ -235,6 +258,8 @@ class IllustriousPadEnhancerHook:
         p: StableDiffusionProcessing,
         pad_enable: bool,
         pad_enable_for: List[str],
+        pad_length: int,
+        pad_enable_normalization: bool,
         *args,
         **kwargs,
     ) -> None:
@@ -244,17 +269,99 @@ class IllustriousPadEnhancerHook:
         def conditioning_modifier(
             model, x, timestep, uncond, cond, cond_scale, model_options, seed
         ):
-            # remove additional PAD if not enabled
-            if not "Positive Prompt" in pad_enable_for:
-                for i in range(len(cond)):
-                    cond[i]["model_conds"]["c_crossattn"].cond = cond[i]["model_conds"][
-                        "c_crossattn"
-                    ].cond[:, :77, :]
-            if not "Negative Prompt" in pad_enable_for:
-                for i in range(len(uncond)):
-                    uncond[i]["model_conds"]["c_crossattn"].cond = uncond[i][
-                        "model_conds"
-                    ]["c_crossattn"].cond[:, :77, :]
+            extra_conds = []
+            dimension = None
+            for i in range(len(self.conds)):
+                current_dimension = self.conds[i]["extra_output"].shape[2]
+                if dimension is None or dimension != current_dimension:
+                    dimension = current_dimension
+                    extra_conds.append([])
+                extra_conds[-1].append(self.conds[i])
+
+            if "Negative Prompt" in pad_enable_for:
+                split_uncond = torch.split(
+                    uncond[0]["model_conds"]["c_crossattn"].cond, 77, dim=1
+                )
+                uncond_results = []
+                for j in range(len(split_uncond)):
+                    extra_uncond_l = extra_conds[0][j]
+                    extra_uncond_g = extra_conds[1][j]
+                    eos_position_l = extra_uncond_l["eos_position"]
+                    eos_position_g = extra_uncond_g["eos_position"]
+
+                    original_pad_length = 77 - eos_position_l - 1
+
+                    if original_pad_length > pad_length:
+                        uncond_results.append(split_uncond[j])
+                        continue
+
+                    split_uncond_l, split_uncond_g = torch.split(
+                        split_uncond[j], [768, 1280], dim=2
+                    )
+
+                    extended_uncond_l = torch.cat(
+                        [
+                            split_uncond_l[:, : eos_position_l + 1, :],
+                            extra_uncond_l["extra_output"],
+                        ],
+                        dim=1,
+                    )
+                    extended_uncond_g = torch.cat(
+                        [
+                            split_uncond_g[:, : eos_position_g + 1, :],
+                            extra_uncond_g["extra_output"],
+                        ],
+                        dim=1,
+                    )
+                    uncond_results.append(
+                        torch.cat([extended_uncond_l, extended_uncond_g], dim=2)
+                    )
+                uncond[0]["model_conds"]["c_crossattn"].cond = torch.cat(
+                    uncond_results, dim=1
+                )
+
+            if "Positive Prompt" in pad_enable_for:
+                split_cond = torch.split(
+                    cond[0]["model_conds"]["c_crossattn"].cond, 77, dim=1
+                )
+                cond_results = []
+                for j in range(len(split_cond)):
+                    extra_cond_l = extra_conds[2][j]
+                    extra_cond_g = extra_conds[3][j]
+                    eos_position_l = extra_cond_l["eos_position"]
+                    eos_position_g = extra_cond_g["eos_position"]
+
+                    original_pad_length = 77 - eos_position_l - 1
+
+                    if original_pad_length > pad_length:
+                        cond_results.append(split_cond[j])
+                        continue
+
+                    split_cond_l, split_cond_g = torch.split(
+                        split_cond[j], [768, 1280], dim=2
+                    )
+
+                    extended_cond_l = torch.cat(
+                        [
+                            split_cond_l[:, : eos_position_l + 1, :],
+                            extra_cond_l["extra_output"],
+                        ],
+                        dim=1,
+                    )
+                    extended_cond_g = torch.cat(
+                        [
+                            split_cond_g[:, : eos_position_g + 1, :],
+                            extra_cond_g["extra_output"],
+                        ],
+                        dim=1,
+                    )
+                    cond_results.append(
+                        torch.cat([extended_cond_l, extended_cond_g], dim=2)
+                    )
+                cond[0]["model_conds"]["c_crossattn"].cond = torch.cat(
+                    cond_results, dim=1
+                )
+
             return model, x, timestep, uncond, cond, cond_scale, model_options, seed
 
         unet = p.sd_model.forge_objects.unet
