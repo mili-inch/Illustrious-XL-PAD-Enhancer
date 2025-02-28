@@ -9,6 +9,7 @@ I hypothesize that this could be due to the CLIP weights not being frozen during
 This extension ensures that additional padding tokens are added to the CLIP Text Encoder input when the number of padding tokens is low.
 
 ## Installation
+This is an extension for [stable-diffusion-webui-reForge](https://github.com/Panchovix/stable-diffusion-webui-reForge).
 
 ```bash
 cd extensions
