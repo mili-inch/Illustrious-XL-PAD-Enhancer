@@ -313,6 +313,15 @@ class IllustriousPadEnhancerHook:
                         ],
                         dim=1,
                     )
+                    if pad_enable_normalization:
+                        mean_split_uncond_l = torch.mean(split_uncond_l)
+                        mean_split_uncond_g = torch.mean(split_uncond_g)
+                        mean_extended_uncond_l = torch.mean(extended_uncond_l)
+                        mean_extended_uncond_g = torch.mean(extended_uncond_g)
+
+                        extended_uncond_l = extended_uncond_l * mean_split_uncond_l / mean_extended_uncond_l
+                        extended_uncond_g = extended_uncond_g * mean_split_uncond_g / mean_extended_uncond_g
+
                     uncond_results.append(
                         torch.cat([extended_uncond_l, extended_uncond_g], dim=2)
                     )
@@ -355,6 +364,15 @@ class IllustriousPadEnhancerHook:
                         ],
                         dim=1,
                     )
+                    if pad_enable_normalization:
+                        mean_split_cond_l = torch.mean(split_cond_l)
+                        mean_split_cond_g = torch.mean(split_cond_g)
+                        mean_extended_cond_l = torch.mean(extended_cond_l)
+                        mean_extended_cond_g = torch.mean(extended_cond_g)
+
+                        extended_cond_l = extended_cond_l * mean_split_cond_l / mean_extended_cond_l
+                        extended_cond_g = extended_cond_g * mean_split_cond_g / mean_extended_cond_g
+
                     cond_results.append(
                         torch.cat([extended_cond_l, extended_cond_g], dim=2)
                     )
